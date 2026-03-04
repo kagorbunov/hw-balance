@@ -23,6 +23,8 @@ const (
 type WithdrawalRepository interface {
 	CreateWithdrawal(ctx context.Context, input model.CreateWithdrawalInput, payloadHash string) (model.Withdrawal, bool, error)
 	GetWithdrawalByID(ctx context.Context, id uuid.UUID) (model.Withdrawal, error)
+	ConfirmWithdrawal(ctx context.Context, id uuid.UUID) (model.Withdrawal, error)
+	CancelWithdrawal(ctx context.Context, id uuid.UUID) (model.Withdrawal, error)
 }
 
 type WithdrawalService struct {
@@ -111,6 +113,44 @@ func (s *WithdrawalService) GetWithdrawal(ctx context.Context, withdrawalID stri
 		return model.Withdrawal{}, model.ErrInvalidWithdrawalID
 	}
 	return s.repo.GetWithdrawalByID(ctx, id)
+}
+
+func (s *WithdrawalService) ConfirmWithdrawal(ctx context.Context, withdrawalID string) (model.Withdrawal, error) {
+	s.logger.Debug("подтверждение вывода", "id", withdrawalID)
+
+	id, err := uuid.Parse(strings.TrimSpace(withdrawalID))
+	if err != nil {
+		s.logger.Warn("некорректный идентификатор вывода", "id", withdrawalID)
+		return model.Withdrawal{}, model.ErrInvalidWithdrawalID
+	}
+
+	withdrawal, err := s.repo.ConfirmWithdrawal(ctx, id)
+	if err != nil {
+		s.logger.Warn("ошибка подтверждения вывода", "error", err, "id", withdrawalID)
+		return model.Withdrawal{}, err
+	}
+
+	s.logger.Info("вывод подтверждён", "id", withdrawal.ID)
+	return withdrawal, nil
+}
+
+func (s *WithdrawalService) CancelWithdrawal(ctx context.Context, withdrawalID string) (model.Withdrawal, error) {
+	s.logger.Debug("отмена вывода", "id", withdrawalID)
+
+	id, err := uuid.Parse(strings.TrimSpace(withdrawalID))
+	if err != nil {
+		s.logger.Warn("некорректный идентификатор вывода", "id", withdrawalID)
+		return model.Withdrawal{}, model.ErrInvalidWithdrawalID
+	}
+
+	withdrawal, err := s.repo.CancelWithdrawal(ctx, id)
+	if err != nil {
+		s.logger.Warn("ошибка отмены вывода", "error", err, "id", withdrawalID)
+		return model.Withdrawal{}, err
+	}
+
+	s.logger.Info("вывод отменён", "id", withdrawal.ID)
+	return withdrawal, nil
 }
 
 func hashCreateWithdrawalPayload(input model.CreateWithdrawalInput) string {

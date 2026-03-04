@@ -242,6 +242,39 @@ func (r *memoryWithdrawalRepository) GetWithdrawalByID(ctx context.Context, id u
 	return withdrawal, nil
 }
 
+func (r *memoryWithdrawalRepository) ConfirmWithdrawal(ctx context.Context, id uuid.UUID) (model.Withdrawal, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	withdrawal, ok := r.withdrawals[id]
+	if !ok {
+		return model.Withdrawal{}, model.ErrWithdrawalNotFound
+	}
+	if withdrawal.Status != model.WithdrawalStatusPending {
+		return model.Withdrawal{}, model.ErrWithdrawalNotPending
+	}
+	withdrawal.Status = model.WithdrawalStatusConfirmed
+	r.withdrawals[id] = withdrawal
+	return withdrawal, nil
+}
+
+func (r *memoryWithdrawalRepository) CancelWithdrawal(ctx context.Context, id uuid.UUID) (model.Withdrawal, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	withdrawal, ok := r.withdrawals[id]
+	if !ok {
+		return model.Withdrawal{}, model.ErrWithdrawalNotFound
+	}
+	if withdrawal.Status != model.WithdrawalStatusPending {
+		return model.Withdrawal{}, model.ErrWithdrawalNotPending
+	}
+	r.balances[withdrawal.UserID][withdrawal.Currency] += withdrawal.Amount
+	withdrawal.Status = model.WithdrawalStatusCancelled
+	r.withdrawals[id] = withdrawal
+	return withdrawal, nil
+}
+
 func (r *memoryWithdrawalRepository) setBalance(userID int64, currency model.Currency, amount int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

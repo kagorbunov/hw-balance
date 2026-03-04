@@ -17,6 +17,13 @@ type WithdrawalRepository struct {
 	logger *slog.Logger
 }
 
+type OperationType string
+
+const (
+	OperationWithdrawalCreate OperationType = "withdrawal_create"
+	OperationWithdrawalCancel OperationType = "withdrawal_cancel"
+)
+
 func NewWithdrawalRepository(db *sql.DB, logger *slog.Logger) *WithdrawalRepository {
 	return &WithdrawalRepository{db: db, logger: logger}
 }
@@ -78,12 +85,13 @@ func (r *WithdrawalRepository) CreateWithdrawal(ctx context.Context, input model
 		return model.Withdrawal{}, false, model.ErrInsufficientBalance
 	}
 
-	_, err = tx.ExecContext(ctx,
-		`UPDATE balances SET amount = amount - $3 WHERE user_id = $1 AND currency = $2`,
+	var balanceAfter int64
+	err = tx.QueryRowContext(ctx,
+		`UPDATE balances SET amount = amount - $3 WHERE user_id = $1 AND currency = $2 RETURNING amount`,
 		input.UserID,
 		string(input.Currency),
 		input.Amount,
-	)
+	).Scan(&balanceAfter)
 	if err != nil {
 		r.logger.Error("ошибка обновления баланса", "error", err, "пользователь", input.UserID)
 		return model.Withdrawal{}, false, err
@@ -126,6 +134,21 @@ func (r *WithdrawalRepository) CreateWithdrawal(ctx context.Context, input model
 	)
 	if err != nil {
 		r.logger.Error("ошибка привязки withdrawal_id к ключу идемпотентности", "error", err, "пользователь", input.UserID)
+		return model.Withdrawal{}, false, err
+	}
+
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO balance_ledger (user_id, currency, amount, balance_after, operation_type, withdrawal_id)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		withdrawal.UserID,
+		string(withdrawal.Currency),
+		-withdrawal.Amount,
+		balanceAfter,
+		string(OperationWithdrawalCreate),
+		withdrawal.ID.String(),
+	)
+	if err != nil {
+		r.logger.Error("ошибка записи в ledger", "error", err, "пользователь", input.UserID)
 		return model.Withdrawal{}, false, err
 	}
 
@@ -185,6 +208,160 @@ func (r *WithdrawalRepository) loadIdempotentWithdrawal(
 
 type withdrawalReader interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func (r *WithdrawalRepository) ConfirmWithdrawal(ctx context.Context, id uuid.UUID) (model.Withdrawal, error) {
+	r.logger.Debug("подтверждение вывода", "id", id)
+
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		r.logger.Error("ошибка открытия транзакции", "error", err)
+		return model.Withdrawal{}, err
+	}
+	defer tx.Rollback()
+
+	var withdrawal model.Withdrawal
+	var withdrawalID, currency, status string
+
+	err = tx.QueryRowContext(ctx,
+		`SELECT id, user_id, amount, currency, destination, status, idempotency_key, created_at
+		 FROM withdrawals WHERE id = $1 FOR UPDATE`,
+		id.String(),
+	).Scan(
+		&withdrawalID,
+		&withdrawal.UserID,
+		&withdrawal.Amount,
+		&currency,
+		&withdrawal.Destination,
+		&status,
+		&withdrawal.IdempotencyKey,
+		&withdrawal.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Withdrawal{}, model.ErrWithdrawalNotFound
+	}
+	if err != nil {
+		r.logger.Error("ошибка чтения записи вывода", "error", err, "id", id)
+		return model.Withdrawal{}, err
+	}
+
+	if status != string(model.WithdrawalStatusPending) {
+		return model.Withdrawal{}, model.ErrWithdrawalNotPending
+	}
+
+	_, err = tx.ExecContext(ctx,
+		`UPDATE withdrawals SET status = $2 WHERE id = $1`,
+		id.String(),
+		string(model.WithdrawalStatusConfirmed),
+	)
+	if err != nil {
+		r.logger.Error("ошибка обновления статуса вывода", "error", err, "id", id)
+		return model.Withdrawal{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		r.logger.Error("ошибка фиксации транзакции", "error", err, "id", id)
+		return model.Withdrawal{}, err
+	}
+
+	parsedID, _ := uuid.Parse(withdrawalID)
+	withdrawal.ID = parsedID
+	withdrawal.Currency = model.Currency(currency)
+	withdrawal.Status = model.WithdrawalStatusConfirmed
+
+	r.logger.Info("вывод подтверждён", "id", id)
+	return withdrawal, nil
+}
+
+func (r *WithdrawalRepository) CancelWithdrawal(ctx context.Context, id uuid.UUID) (model.Withdrawal, error) {
+	r.logger.Debug("отмена вывода", "id", id)
+
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		r.logger.Error("ошибка открытия транзакции", "error", err)
+		return model.Withdrawal{}, err
+	}
+	defer tx.Rollback()
+
+	var withdrawal model.Withdrawal
+	var withdrawalID, currency, status string
+
+	err = tx.QueryRowContext(ctx,
+		`SELECT id, user_id, amount, currency, destination, status, idempotency_key, created_at
+		 FROM withdrawals WHERE id = $1 FOR UPDATE`,
+		id.String(),
+	).Scan(
+		&withdrawalID,
+		&withdrawal.UserID,
+		&withdrawal.Amount,
+		&currency,
+		&withdrawal.Destination,
+		&status,
+		&withdrawal.IdempotencyKey,
+		&withdrawal.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Withdrawal{}, model.ErrWithdrawalNotFound
+	}
+	if err != nil {
+		r.logger.Error("ошибка чтения записи вывода", "error", err, "id", id)
+		return model.Withdrawal{}, err
+	}
+
+	if status != string(model.WithdrawalStatusPending) {
+		return model.Withdrawal{}, model.ErrWithdrawalNotPending
+	}
+
+	var balanceAfter int64
+	err = tx.QueryRowContext(ctx,
+		`UPDATE balances SET amount = amount + $3 WHERE user_id = $1 AND currency = $2 RETURNING amount`,
+		withdrawal.UserID,
+		currency,
+		withdrawal.Amount,
+	).Scan(&balanceAfter)
+	if err != nil {
+		r.logger.Error("ошибка возврата средств на баланс", "error", err, "id", id)
+		return model.Withdrawal{}, err
+	}
+
+	_, err = tx.ExecContext(ctx,
+		`UPDATE withdrawals SET status = $2 WHERE id = $1`,
+		id.String(),
+		string(model.WithdrawalStatusCancelled),
+	)
+	if err != nil {
+		r.logger.Error("ошибка обновления статуса вывода", "error", err, "id", id)
+		return model.Withdrawal{}, err
+	}
+
+	parsedID, _ := uuid.Parse(withdrawalID)
+	withdrawal.ID = parsedID
+	withdrawal.Currency = model.Currency(currency)
+
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO balance_ledger (user_id, currency, amount, balance_after, operation_type, withdrawal_id)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		withdrawal.UserID,
+		currency,
+		withdrawal.Amount,
+		balanceAfter,
+		string(OperationWithdrawalCancel),
+		withdrawal.ID.String(),
+	)
+	if err != nil {
+		r.logger.Error("ошибка записи в ledger", "error", err, "id", id)
+		return model.Withdrawal{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		r.logger.Error("ошибка фиксации транзакции", "error", err, "id", id)
+		return model.Withdrawal{}, err
+	}
+
+	withdrawal.Status = model.WithdrawalStatusCancelled
+
+	r.logger.Info("вывод отменён", "id", id)
+	return withdrawal, nil
 }
 
 func (r *WithdrawalRepository) getWithdrawalByID(ctx context.Context, reader withdrawalReader, id string) (model.Withdrawal, error) {

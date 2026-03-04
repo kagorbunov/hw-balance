@@ -13,4 +13,5 @@ var (
 	ErrIdempotencyPayloadMismatch = errors.New("idempotency payload mismatch")
 	ErrWithdrawalNotFound         = errors.New("withdrawal not found")
 	ErrWithdrawalInProgress       = errors.New("withdrawal in progress")
+	ErrWithdrawalNotPending       = errors.New("withdrawal is not in pending status")
 )

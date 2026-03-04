@@ -78,6 +78,7 @@ func setupTestEnv(t *testing.T) *testEnv {
 
 func resetDatabase(db *sql.DB) error {
 	queries := []string{
+		"DELETE FROM balance_ledger",
 		"DELETE FROM idempotency_keys",
 		"DELETE FROM withdrawals",
 		"DELETE FROM balances",
@@ -626,5 +627,143 @@ func TestConcurrentIdempotentRequests(t *testing.T) {
 
 	if env.countWithdrawals(t) != 1 {
 		t.Fatalf("expected 1 withdrawal, got %d", env.countWithdrawals(t))
+	}
+}
+
+func (e *testEnv) confirmWithdrawal(t *testing.T, id string) *http.Response {
+	t.Helper()
+
+	httpReq, _ := http.NewRequest(http.MethodPost, e.server.URL+"/v1/withdrawals/"+id+"/confirm", nil)
+	httpReq.Header.Set("Authorization", "Bearer "+testAuthToken)
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	return resp
+}
+
+func (e *testEnv) cancelWithdrawal(t *testing.T, id string) *http.Response {
+	t.Helper()
+
+	httpReq, _ := http.NewRequest(http.MethodPost, e.server.URL+"/v1/withdrawals/"+id+"/cancel", nil)
+	httpReq.Header.Set("Authorization", "Bearer "+testAuthToken)
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	return resp
+}
+
+func TestConfirmWithdrawalSuccess(t *testing.T) {
+	env := setupTestEnv(t)
+	defer env.cleanup()
+
+	env.setBalance(t, 1, 10000)
+
+	_, created := env.createWithdrawal(t, dto.CreateWithdrawalRequest{
+		UserID:         1,
+		Amount:         500,
+		Currency:       "USDT",
+		Destination:    "wallet-confirm",
+		IdempotencyKey: "confirm-key-1",
+	})
+
+	resp := env.confirmWithdrawal(t, created.ID)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	getResp, result := env.getWithdrawal(t, created.ID)
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", getResp.StatusCode)
+	}
+	if result.Status != "confirmed" {
+		t.Fatalf("expected status confirmed, got %s", result.Status)
+	}
+}
+
+func TestCancelWithdrawalSuccess(t *testing.T) {
+	env := setupTestEnv(t)
+	defer env.cleanup()
+
+	env.setBalance(t, 1, 10000)
+
+	_, created := env.createWithdrawal(t, dto.CreateWithdrawalRequest{
+		UserID:         1,
+		Amount:         500,
+		Currency:       "USDT",
+		Destination:    "wallet-cancel",
+		IdempotencyKey: "cancel-key-1",
+	})
+
+	if env.getBalance(t, 1) != 9500 {
+		t.Fatalf("expected balance 9500 after create, got %d", env.getBalance(t, 1))
+	}
+
+	resp := env.cancelWithdrawal(t, created.ID)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	if env.getBalance(t, 1) != 10000 {
+		t.Fatalf("expected balance 10000 after cancel, got %d", env.getBalance(t, 1))
+	}
+
+	getResp, result := env.getWithdrawal(t, created.ID)
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", getResp.StatusCode)
+	}
+	if result.Status != "cancelled" {
+		t.Fatalf("expected status cancelled, got %s", result.Status)
+	}
+}
+
+func TestConfirmWithdrawalNotPending(t *testing.T) {
+	env := setupTestEnv(t)
+	defer env.cleanup()
+
+	env.setBalance(t, 1, 10000)
+
+	_, created := env.createWithdrawal(t, dto.CreateWithdrawalRequest{
+		UserID:         1,
+		Amount:         500,
+		Currency:       "USDT",
+		Destination:    "wallet-double-confirm",
+		IdempotencyKey: "double-confirm-key",
+	})
+
+	env.confirmWithdrawal(t, created.ID)
+
+	resp := env.confirmWithdrawal(t, created.ID)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", resp.StatusCode)
+	}
+}
+
+func TestCancelAfterConfirmFails(t *testing.T) {
+	env := setupTestEnv(t)
+	defer env.cleanup()
+
+	env.setBalance(t, 1, 10000)
+
+	_, created := env.createWithdrawal(t, dto.CreateWithdrawalRequest{
+		UserID:         1,
+		Amount:         500,
+		Currency:       "USDT",
+		Destination:    "wallet-confirm-then-cancel",
+		IdempotencyKey: "confirm-cancel-key",
+	})
+
+	env.confirmWithdrawal(t, created.ID)
+
+	resp := env.cancelWithdrawal(t, created.ID)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", resp.StatusCode)
 	}
 }

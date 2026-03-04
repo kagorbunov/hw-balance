@@ -110,6 +110,7 @@ func waitForServer(baseURL string, timeout time.Duration) error {
 
 func (e *e2eEnv) resetDatabase() error {
 	queries := []string{
+		"DELETE FROM balance_ledger",
 		"DELETE FROM idempotency_keys",
 		"DELETE FROM withdrawals",
 		"DELETE FROM balances",
@@ -784,6 +785,232 @@ func TestE2E_FullFlow(t *testing.T) {
 
 	if env.countWithdrawals(t) != 2 {
 		t.Fatalf("expected 2 withdrawals total, got %d", env.countWithdrawals(t))
+	}
+}
+
+func TestE2E_ConfirmWithdrawal_Success(t *testing.T) {
+	env := setupE2E(t)
+	env.setBalance(t, 1, 10000)
+
+	_, created, _ := env.createWithdrawal(t, createWithdrawalRequest{
+		UserID:         1,
+		Amount:         500,
+		Currency:       "USDT",
+		Destination:    "TRC20-wallet-confirm",
+		IdempotencyKey: fmt.Sprintf("e2e-confirm-%d", time.Now().UnixNano()),
+	})
+
+	resp, body, err := env.doRequest(http.MethodPost, "/v1/withdrawals/"+created.ID+"/confirm", nil, true)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var result withdrawalResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+
+	if result.Status != "confirmed" {
+		t.Fatalf("expected status confirmed, got %s", result.Status)
+	}
+
+	balance := env.getBalance(t, 1)
+	if balance != 9500 {
+		t.Fatalf("expected balance 9500, got %d", balance)
+	}
+}
+
+func TestE2E_ConfirmWithdrawal_AlreadyConfirmed(t *testing.T) {
+	env := setupE2E(t)
+	env.setBalance(t, 1, 10000)
+
+	_, created, _ := env.createWithdrawal(t, createWithdrawalRequest{
+		UserID:         1,
+		Amount:         300,
+		Currency:       "USDT",
+		Destination:    "TRC20-wallet-double-confirm",
+		IdempotencyKey: fmt.Sprintf("e2e-double-confirm-%d", time.Now().UnixNano()),
+	})
+
+	resp1, _, _ := env.doRequest(http.MethodPost, "/v1/withdrawals/"+created.ID+"/confirm", nil, true)
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("first confirm: expected 200, got %d", resp1.StatusCode)
+	}
+
+	resp2, _, _ := env.doRequest(http.MethodPost, "/v1/withdrawals/"+created.ID+"/confirm", nil, true)
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("second confirm: expected 409, got %d", resp2.StatusCode)
+	}
+}
+
+func TestE2E_CancelWithdrawal_Success(t *testing.T) {
+	env := setupE2E(t)
+	env.setBalance(t, 1, 10000)
+
+	_, created, _ := env.createWithdrawal(t, createWithdrawalRequest{
+		UserID:         1,
+		Amount:         500,
+		Currency:       "USDT",
+		Destination:    "TRC20-wallet-cancel",
+		IdempotencyKey: fmt.Sprintf("e2e-cancel-%d", time.Now().UnixNano()),
+	})
+
+	balanceAfterCreate := env.getBalance(t, 1)
+	if balanceAfterCreate != 9500 {
+		t.Fatalf("expected balance 9500 after create, got %d", balanceAfterCreate)
+	}
+
+	resp, body, err := env.doRequest(http.MethodPost, "/v1/withdrawals/"+created.ID+"/cancel", nil, true)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var result withdrawalResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+
+	if result.Status != "cancelled" {
+		t.Fatalf("expected status cancelled, got %s", result.Status)
+	}
+
+	balanceAfterCancel := env.getBalance(t, 1)
+	if balanceAfterCancel != 10000 {
+		t.Fatalf("expected balance 10000 after cancel, got %d", balanceAfterCancel)
+	}
+}
+
+func TestE2E_CancelWithdrawal_AlreadyCancelled(t *testing.T) {
+	env := setupE2E(t)
+	env.setBalance(t, 1, 10000)
+
+	_, created, _ := env.createWithdrawal(t, createWithdrawalRequest{
+		UserID:         1,
+		Amount:         300,
+		Currency:       "USDT",
+		Destination:    "TRC20-wallet-double-cancel",
+		IdempotencyKey: fmt.Sprintf("e2e-double-cancel-%d", time.Now().UnixNano()),
+	})
+
+	resp1, _, _ := env.doRequest(http.MethodPost, "/v1/withdrawals/"+created.ID+"/cancel", nil, true)
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("first cancel: expected 200, got %d", resp1.StatusCode)
+	}
+
+	resp2, _, _ := env.doRequest(http.MethodPost, "/v1/withdrawals/"+created.ID+"/cancel", nil, true)
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("second cancel: expected 409, got %d", resp2.StatusCode)
+	}
+}
+
+func TestE2E_CancelAfterConfirm_Fails(t *testing.T) {
+	env := setupE2E(t)
+	env.setBalance(t, 1, 10000)
+
+	_, created, _ := env.createWithdrawal(t, createWithdrawalRequest{
+		UserID:         1,
+		Amount:         300,
+		Currency:       "USDT",
+		Destination:    "TRC20-wallet-confirm-then-cancel",
+		IdempotencyKey: fmt.Sprintf("e2e-confirm-cancel-%d", time.Now().UnixNano()),
+	})
+
+	resp1, _, _ := env.doRequest(http.MethodPost, "/v1/withdrawals/"+created.ID+"/confirm", nil, true)
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("confirm: expected 200, got %d", resp1.StatusCode)
+	}
+
+	resp2, _, _ := env.doRequest(http.MethodPost, "/v1/withdrawals/"+created.ID+"/cancel", nil, true)
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("cancel after confirm: expected 409, got %d", resp2.StatusCode)
+	}
+}
+
+func TestE2E_ConfirmAfterCancel_Fails(t *testing.T) {
+	env := setupE2E(t)
+	env.setBalance(t, 1, 10000)
+
+	_, created, _ := env.createWithdrawal(t, createWithdrawalRequest{
+		UserID:         1,
+		Amount:         300,
+		Currency:       "USDT",
+		Destination:    "TRC20-wallet-cancel-then-confirm",
+		IdempotencyKey: fmt.Sprintf("e2e-cancel-confirm-%d", time.Now().UnixNano()),
+	})
+
+	resp1, _, _ := env.doRequest(http.MethodPost, "/v1/withdrawals/"+created.ID+"/cancel", nil, true)
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("cancel: expected 200, got %d", resp1.StatusCode)
+	}
+
+	resp2, _, _ := env.doRequest(http.MethodPost, "/v1/withdrawals/"+created.ID+"/confirm", nil, true)
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("confirm after cancel: expected 409, got %d", resp2.StatusCode)
+	}
+}
+
+func TestE2E_ConfirmWithdrawal_NotFound(t *testing.T) {
+	env := setupE2E(t)
+
+	resp, _, _ := env.doRequest(http.MethodPost, "/v1/withdrawals/00000000-0000-0000-0000-000000000000/confirm", nil, true)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestE2E_CancelWithdrawal_NotFound(t *testing.T) {
+	env := setupE2E(t)
+
+	resp, _, _ := env.doRequest(http.MethodPost, "/v1/withdrawals/00000000-0000-0000-0000-000000000000/cancel", nil, true)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestE2E_Ledger_RecordsOnCreateAndCancel(t *testing.T) {
+	env := setupE2E(t)
+	env.setBalance(t, 1, 10000)
+
+	_, created, _ := env.createWithdrawal(t, createWithdrawalRequest{
+		UserID:         1,
+		Amount:         500,
+		Currency:       "USDT",
+		Destination:    "TRC20-wallet-ledger",
+		IdempotencyKey: fmt.Sprintf("e2e-ledger-%d", time.Now().UnixNano()),
+	})
+
+	var createCount int
+	err := env.db.QueryRow(
+		"SELECT COUNT(*) FROM balance_ledger WHERE withdrawal_id = $1 AND operation_type = 'withdrawal_create'",
+		created.ID,
+	).Scan(&createCount)
+	if err != nil {
+		t.Fatalf("failed to query ledger: %v", err)
+	}
+	if createCount != 1 {
+		t.Fatalf("expected 1 create ledger entry, got %d", createCount)
+	}
+
+	env.doRequest(http.MethodPost, "/v1/withdrawals/"+created.ID+"/cancel", nil, true)
+
+	var cancelCount int
+	err = env.db.QueryRow(
+		"SELECT COUNT(*) FROM balance_ledger WHERE withdrawal_id = $1 AND operation_type = 'withdrawal_cancel'",
+		created.ID,
+	).Scan(&cancelCount)
+	if err != nil {
+		t.Fatalf("failed to query ledger: %v", err)
+	}
+	if cancelCount != 1 {
+		t.Fatalf("expected 1 cancel ledger entry, got %d", cancelCount)
 	}
 }
 

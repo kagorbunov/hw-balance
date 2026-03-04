@@ -12,7 +12,11 @@ const CurrencyUSDT Currency = "USDT"
 
 type WithdrawalStatus string
 
-const WithdrawalStatusPending WithdrawalStatus = "pending"
+const (
+	WithdrawalStatusPending   WithdrawalStatus = "pending"
+	WithdrawalStatusConfirmed WithdrawalStatus = "confirmed"
+	WithdrawalStatusCancelled WithdrawalStatus = "cancelled"
+)
 
 type Withdrawal struct {
 	ID             uuid.UUID

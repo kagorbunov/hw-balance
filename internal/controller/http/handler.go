@@ -31,6 +31,8 @@ func (h *Handler) Router() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/withdrawals", h.withAuth(http.HandlerFunc(h.createWithdrawal)))
 	mux.Handle("GET /v1/withdrawals/{id}", h.withAuth(http.HandlerFunc(h.getWithdrawal)))
+	mux.Handle("POST /v1/withdrawals/{id}/confirm", h.withAuth(http.HandlerFunc(h.confirmWithdrawal)))
+	mux.Handle("POST /v1/withdrawals/{id}/cancel", h.withAuth(http.HandlerFunc(h.cancelWithdrawal)))
 	return mux
 }
 
@@ -97,6 +99,54 @@ func (h *Handler) getWithdrawal(w http.ResponseWriter, r *http.Request) {
 	httputil.WriteJSON(w, http.StatusOK, response)
 }
 
+func (h *Handler) confirmWithdrawal(w http.ResponseWriter, r *http.Request) {
+	withdrawalID := r.PathValue("id")
+	h.logger.Debug("подтверждение вывода", "id", withdrawalID)
+
+	withdrawal, err := h.service.ConfirmWithdrawal(r.Context(), withdrawalID)
+	if err != nil {
+		h.writeUseCaseError(w, r, err)
+		return
+	}
+
+	h.logger.Info("вывод подтверждён", "id", withdrawal.ID)
+
+	response := dto.WithdrawalResponse{
+		ID:          withdrawal.ID.String(),
+		UserID:      withdrawal.UserID,
+		Amount:      withdrawal.Amount,
+		Currency:    string(withdrawal.Currency),
+		Destination: withdrawal.Destination,
+		Status:      string(withdrawal.Status),
+		CreatedAt:   withdrawal.CreatedAt.UTC().Format(http.TimeFormat),
+	}
+	httputil.WriteJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) cancelWithdrawal(w http.ResponseWriter, r *http.Request) {
+	withdrawalID := r.PathValue("id")
+	h.logger.Debug("отмена вывода", "id", withdrawalID)
+
+	withdrawal, err := h.service.CancelWithdrawal(r.Context(), withdrawalID)
+	if err != nil {
+		h.writeUseCaseError(w, r, err)
+		return
+	}
+
+	h.logger.Info("вывод отменён", "id", withdrawal.ID)
+
+	response := dto.WithdrawalResponse{
+		ID:          withdrawal.ID.String(),
+		UserID:      withdrawal.UserID,
+		Amount:      withdrawal.Amount,
+		Currency:    string(withdrawal.Currency),
+		Destination: withdrawal.Destination,
+		Status:      string(withdrawal.Status),
+		CreatedAt:   withdrawal.CreatedAt.UTC().Format(http.TimeFormat),
+	}
+	httputil.WriteJSON(w, http.StatusOK, response)
+}
+
 func (h *Handler) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !h.authorized(r) {
@@ -143,6 +193,9 @@ func (h *Handler) writeUseCaseError(w http.ResponseWriter, r *http.Request, err 
 	case errors.Is(err, model.ErrWithdrawalInProgress):
 		h.logger.Warn("вывод в процессе создания", "метод", r.Method, "путь", r.URL.Path)
 		httputil.WriteError(w, http.StatusConflict, "withdrawal in progress, please retry")
+	case errors.Is(err, model.ErrWithdrawalNotPending):
+		h.logger.Warn("вывод не в статусе pending", "метод", r.Method, "путь", r.URL.Path)
+		httputil.WriteError(w, http.StatusConflict, model.ErrWithdrawalNotPending.Error())
 	default:
 		h.logger.Error("внутренняя ошибка сервиса", "error", err, "метод", r.Method, "путь", r.URL.Path)
 		httputil.WriteError(w, http.StatusInternalServerError, "internal server error")
